@@ -1,0 +1,5 @@
+Learnings:
+
+1. Go channels
+2. Structs
+3. Interfaces and patterns

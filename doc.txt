@@ -1,0 +1,5 @@
+1. How to check if ingress controller already installed or not?
+2. Which ingress controller to install?
+    -> nginx
+    -> traefik
+

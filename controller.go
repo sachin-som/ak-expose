@@ -6,6 +6,7 @@ import (
 
 	apiappsv1 "k8s.io/api/apps/v1"
 	apicorev1 "k8s.io/api/core/v1"
+	apinetv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
@@ -96,7 +97,8 @@ func (c *controller) syncDeployment(ns, name string) error {
 		klog.Fatal("Error in getting deployment: ", err.Error())
 		return err
 	}
-	// create service
+
+	// create service object
 	svc := apicorev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deployment.Name,
@@ -112,16 +114,57 @@ func (c *controller) syncDeployment(ns, name string) error {
 			},
 		},
 	}
-	_, err = c.clientset.CoreV1().Services(ns).Create(ctx, &svc, metav1.CreateOptions{})
+	createdsvc, err := c.clientset.CoreV1().Services(ns).Create(ctx, &svc, metav1.CreateOptions{})
 
 	if err != nil {
 		klog.Fatal("Error while creating service: ", err.Error())
 		return err
 	}
 
-	klog.Info("Created service with name ", deployment.Name, "in namespace ", deployment.Namespace)
+	klog.Info("Created service with name ", deployment.Name, " in namespace ", deployment.Namespace)
 
-	// create ingress
+	// create ingress object
+	ingressPathType := "Prefix"
+	ing := apinetv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: createdsvc.Name,
+			Annotations: map[string]string{
+				"nginx.ingress.kubernetes.io/rewrite-target": "/",
+			},
+		},
+		Spec: apinetv1.IngressSpec{
+			Rules: []apinetv1.IngressRule{
+				{
+					IngressRuleValue: apinetv1.IngressRuleValue{
+						HTTP: &apinetv1.HTTPIngressRuleValue{
+							Paths: []apinetv1.HTTPIngressPath{
+								{
+									Path:     createdsvc.Name,
+									PathType: (*apinetv1.PathType)(&ingressPathType),
+									Backend: apinetv1.IngressBackend{
+										Service: &apinetv1.IngressServiceBackend{
+											Name: createdsvc.Name,
+											Port: apinetv1.ServiceBackendPort{
+												Number: 80, // TODO: Make it dynamic
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err = c.clientset.NetworkingV1().Ingresses(createdsvc.Namespace).Create(ctx, &ing, metav1.CreateOptions{})
+
+	if err != nil {
+		klog.Fatal("Error in creating ingress: ", err.Error())
+		return err
+	}
+
 	return nil
 }
 

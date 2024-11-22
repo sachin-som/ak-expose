@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	apiappsv1 "k8s.io/api/apps/v1"
 	apicorev1 "k8s.io/api/core/v1"
 	apinetv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
 	"k8s.io/client-go/kubernetes"
@@ -36,6 +39,7 @@ func newController(clientset kubernetes.Clientset, deploymentInformer appsinform
 	deploymentInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.handleAddDeployment,
 		DeleteFunc: c.handleDeleteDeployment,
+		// UpdateFunc: c.handleUpdateDeployment,
 	})
 	return c
 }
@@ -93,41 +97,117 @@ func (c *controller) syncDeployment(ns, name string) error {
 	ctx := context.Background()
 
 	deployment, err := c.deploymentLister.Deployments(ns).Get(name)
+
 	if err != nil {
+
+		// Check if the deployemnt is deleted
+		if errors.IsNotFound(err) {
+			klog.Infof("handle delete event for dep %s\n", name)
+			err := c.clientset.CoreV1().Services(ns).Delete(ctx, name, metav1.DeleteOptions{})
+			if err != nil {
+				klog.Infof("deleting service %s, error %s\n", name, err.Error())
+				return err
+			}
+
+			err = c.clientset.NetworkingV1().Ingresses(ns).Delete(ctx, name, metav1.DeleteOptions{})
+			if err != nil {
+				klog.Infof("deleting ingrss %s, error %s\n", name, err.Error())
+				return err
+			}
+
+			return nil
+		}
+
 		klog.Fatal("Error in getting deployment: ", err.Error())
 		return err
 	}
 
-	// create service object
-	svc := apicorev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      deployment.Name,
-			Namespace: ns,
-		},
-		Spec: apicorev1.ServiceSpec{
-			Selector: deploymentLabels(*deployment),
-			Ports: []apicorev1.ServicePort{
-				{
-					Name: "http",
-					Port: 80, // TODO: figure out name and port from deployment
-				},
-			},
-		},
-	}
-	createdsvc, err := c.clientset.CoreV1().Services(ns).Create(ctx, &svc, metav1.CreateOptions{})
+	createdsvc, err := c.createService(ctx, deployment)
 
 	if err != nil {
-		klog.Fatal("Error while creating service: ", err.Error())
+		klog.Infof("Error in creating service: %s", err.Error())
+		if errors.IsAlreadyExists(err) {
+			return nil
+		}
 		return err
 	}
 
-	klog.Info("Created service with name ", deployment.Name, " in namespace ", deployment.Namespace)
+	if createdsvc == nil {
+		return nil
+	}
+
+	klog.Info("Created service with name ", createdsvc.Name, " in namespace ", createdsvc.Namespace)
 
 	// create ingress object
-	ingressPathType := "Prefix"
-	ing := apinetv1.Ingress{
+	createding, err := c.createIngress(ctx, createdsvc)
+
+	if err != nil {
+		klog.Infof("Error in creating ingress: %s", err.Error())
+		if errors.IsAlreadyExists(err) {
+			return nil
+		}
+		return err
+	}
+
+	if createding != nil {
+		klog.Infof("Created ingress with name %s in namespace %s", createding.Name, createding.Namespace)
+	}
+	return nil
+}
+
+func (c *controller) createService(context context.Context, deployment *apiappsv1.Deployment) (*apicorev1.Service, error) {
+
+	// Dynamically create service ports as per pods ports
+	// Extract container ports from the deployment specification (deployment.spec.template.spec.container.ports)
+	// Map the above ports to the target ports
+	// Create unique ports for port/map the same target port to the port
+	containers := deployment.Spec.Template.Spec.Containers
+
+	if len(containers) == 0 {
+		klog.InfoS("No containers are found inside %s deployment, skipping service creation.", deployment.Name)
+		return nil, nil
+	}
+
+	var servicePorts []apicorev1.ServicePort
+	portIndex := 0
+	for _, container := range containers {
+		for _, port := range container.Ports {
+			servicePorts = append(servicePorts, apicorev1.ServicePort{
+				Name:       fmt.Sprintf("port-%d", portIndex),
+				Protocol:   port.Protocol,
+				Port:       port.ContainerPort,
+				TargetPort: intstr.FromInt(int(port.ContainerPort)),
+				// NodePort: "", // TODO: maybe someday take it as input
+			})
+			portIndex++
+		}
+	}
+
+	if len(servicePorts) == 0 {
+		klog.Infof("No ports found in deployment %s, skipping service creation.", deployment.Name)
+		return nil, nil
+	}
+
+	// create service object
+	svcObj := apicorev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: createdsvc.Name,
+			Name:      deployment.Name,
+			Namespace: deployment.Namespace,
+		},
+		Spec: apicorev1.ServiceSpec{
+			Selector: deploymentLabels(*deployment),
+			Ports:    servicePorts,
+		},
+	}
+
+	return c.clientset.CoreV1().Services(deployment.Namespace).Create(context, &svcObj, metav1.CreateOptions{})
+}
+
+func (c *controller) createIngress(context context.Context, service *apicorev1.Service) (*apinetv1.Ingress, error) {
+	ingressPathType := "Prefix"
+	ingObj := apinetv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: service.Name,
 			Annotations: map[string]string{
 				"nginx.ingress.kubernetes.io/rewrite-target": "/",
 			},
@@ -139,11 +219,11 @@ func (c *controller) syncDeployment(ns, name string) error {
 						HTTP: &apinetv1.HTTPIngressRuleValue{
 							Paths: []apinetv1.HTTPIngressPath{
 								{
-									Path:     createdsvc.Name,
+									Path:     fmt.Sprintf("/%s", service.Name),
 									PathType: (*apinetv1.PathType)(&ingressPathType),
 									Backend: apinetv1.IngressBackend{
 										Service: &apinetv1.IngressServiceBackend{
-											Name: createdsvc.Name,
+											Name: service.Name,
 											Port: apinetv1.ServiceBackendPort{
 												Number: 80, // TODO: Make it dynamic
 											},
@@ -158,14 +238,7 @@ func (c *controller) syncDeployment(ns, name string) error {
 		},
 	}
 
-	_, err = c.clientset.NetworkingV1().Ingresses(createdsvc.Namespace).Create(ctx, &ing, metav1.CreateOptions{})
-
-	if err != nil {
-		klog.Fatal("Error in creating ingress: ", err.Error())
-		return err
-	}
-
-	return nil
+	return c.clientset.NetworkingV1().Ingresses(service.Namespace).Create(context, &ingObj, metav1.CreateOptions{})
 }
 
 func deploymentLabels(deployment apiappsv1.Deployment) map[string]string {
@@ -181,3 +254,8 @@ func (c *controller) handleDeleteDeployment(obj interface{}) {
 	klog.Info("Added object to workqueue on delete deployment")
 	c.queue.Add(obj)
 }
+
+// func (c *controller) handleUpdateDeployment(oldObj, newObj interface{}) {
+// 	klog.Info("Added object to workqueue on update deployment")
+// 	c.queue.Add(newObj)
+// }
